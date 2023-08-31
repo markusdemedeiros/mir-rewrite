@@ -21,11 +21,17 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use rustc_ast_pretty::pprust::item_to_string;
+use rustc_data_structures::steal::Steal;
 use rustc_driver::Compilation;
 use rustc_errors::registry;
 use rustc_middle::middle::provide;
 use rustc_middle::mir::Location;
-use rustc_middle::mir::{BasicBlock, BasicBlockData, Body, StatementKind};
+use rustc_middle::mir::SourceInfo;
+use rustc_middle::mir::SourceScope;
+use rustc_middle::mir::{
+    BasicBlock, BasicBlockData, Body, Statement, StatementKind, Terminator, TerminatorKind,
+    OUTERMOST_SOURCE_SCOPE,
+};
 use rustc_middle::query::queries::mir_built::{self, ProvidedValue};
 use rustc_middle::query::Providers;
 use rustc_middle::ty;
@@ -33,18 +39,23 @@ use rustc_session::config::{self, CheckCfg};
 use rustc_session::EarlyErrorHandler;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map;
+use rustc_span::DUMMY_SP;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::sync::LazyLock;
+use std::thread::current;
 use std::{path, process, str};
-
-use rustc_data_structures::steal::Steal;
 
 #[allow(dead_code)]
 struct OurCompilerCalls {
     args: Vec<String>,
 }
+
+const FORGED_SOURCE_INFO: SourceInfo = SourceInfo {
+    span: DUMMY_SP,
+    scope: OUTERMOST_SOURCE_SCOPE,
+};
 
 struct BodyModifier<'mir, 'tcx> {
     /// MIR body under modification
@@ -104,6 +115,99 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
             }
         }
     }
+
+    /// Insert nop
+    /// Shift every statment in the current block down by one
+    /// if location is the terminator, this function inserts it at the end of the statements list
+    // pub fn insert_nop_before(&mut self, loc: &Location) {
+    //     let current_loc = self.location_table.get(loc).unwrap();
+    //     let current_block_statements =
+    //         &mut (self.body.basic_blocks.as_mut_preserves_cfg()[current_loc.block]).statements;
+    //     // Allocate space for the nop
+    //     current_block_statements.push(Statement {
+    //         source_info: FORGED_SOURCE_INFO.clone(),
+    //         kind: StatementKind::Nop,
+    //     });
+    //     todo!()
+    // }
+
+    // Splits a block before the given location
+    pub fn allocate_test_branch_before(&mut self, loc: &Location) -> BasicBlock {
+        // Generate fresh block indices for the test block and continuation block
+        let kont_block: BasicBlock = self.body.basic_blocks.len().into();
+        let test_block: BasicBlock = (self.body.basic_blocks.len() + 1).into();
+
+        // current location corresponding to loc
+        let current_loc = *self.location_table.get(loc).unwrap();
+        // data for the current block
+        let current_block_data = self
+            .body
+            .basic_blocks
+            .as_mut()
+            .as_mut_slice()
+            .get_mut(current_loc.block)
+            .unwrap();
+
+        // collect the MIR statements that belong in the continuation
+        let mut kont_block_data = BasicBlockData {
+            statements: current_block_data.statements[current_loc.statement_index..].to_vec(),
+            terminator: current_block_data.terminator.clone(),
+            is_cleanup: false,
+        };
+
+        // Keep only the statements before the split in the old block
+        current_block_data.statements =
+            current_block_data.statements[0..current_loc.statement_index].to_vec();
+
+        // Update the terminator of the old block to be a FalseEdge
+        current_block_data.terminator = Some(Terminator {
+            source_info: FORGED_SOURCE_INFO.clone(),
+            kind: TerminatorKind::FalseEdge {
+                real_target: kont_block,
+                imaginary_target: test_block,
+            },
+        });
+
+        // Set up the test block
+        let mut test_block_data = BasicBlockData {
+            statements: vec![],
+            terminator: Some(Terminator {
+                source_info: FORGED_SOURCE_INFO.clone(),
+                kind: TerminatorKind::Unreachable,
+            }),
+            is_cleanup: false,
+        };
+
+        // Move the test continuation block and the test block into the MIR
+        assert_eq!(
+            kont_block,
+            self.body.basic_blocks.as_mut().push(kont_block_data)
+        );
+        assert_eq!(
+            test_block,
+            self.body.basic_blocks.as_mut().push(test_block_data)
+        );
+
+        // Update the current indicies of all locations which got moved.
+        // Moved locations have their value block equal to current block
+        //  and their statement index equal or after current_loc
+        //  1. point to the freshly generated block
+        //  2. subtract current_loc.statement_index from their statement_index
+        // looking up loc should return (Location { kont_block, 0 }).
+        for (k_loc, v_loc) in self.location_table.iter_mut() {
+            if (v_loc.block == current_loc.block)
+                && (v_loc.statement_index >= current_loc.statement_index)
+            {
+                *v_loc = Location {
+                    block: kont_block,
+                    statement_index: v_loc.statement_index - current_loc.statement_index,
+                }
+            }
+        }
+
+        // Return the index of the test block, to be populated by another function
+        return test_block;
+    }
 }
 
 #[allow(clippy::needless_lifetimes)]
@@ -118,10 +222,19 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
 
     // Modify and return the MIR
     let mut body_modifier = BodyModifier::new(&mut body);
-    body_modifier.overwrite_all_as_nop();
+    let tb0 = body_modifier.allocate_test_branch_before(&Location {
+        block: BasicBlock::from_u32(0),
+        statement_index: 5,
+    });
+    println!("first test block is {:?}", tb0);
 
-    println!("=================================");
-    println!("[log] modified MIR: {:#?}", body.basic_blocks);
+    // let tb1 = body_modifier.allocate_test_branch_before(&Location {
+    //     block: BasicBlock::from_u32(0),
+    //     statement_index: 5,
+    // });
+    // println!("second test block is {:?}", tb1);
+    // println!("=================================");
+    // println!("[log] modified MIR: {:#?}", body.basic_blocks);
     return tcx.alloc_steal_mir(body);
 }
 
@@ -162,7 +275,12 @@ impl rustc_driver::Callbacks for OurCompilerCalls {
                 assert!(tcx.is_mir_available(main_id), "MIR is unavailable");
 
                 let mir = tcx.mir_built(main_id.as_local().unwrap());
-                println!("[info] MIR basic blocks: {:#?}", mir.borrow().basic_blocks);
+
+                println!("=================================");
+                println!(
+                    "[info] final MIR basic blocks: {:#?}",
+                    mir.borrow().basic_blocks
+                );
             });
         });
 

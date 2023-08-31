@@ -24,7 +24,8 @@ use rustc_ast_pretty::pprust::item_to_string;
 use rustc_driver::Compilation;
 use rustc_errors::registry;
 use rustc_middle::middle::provide;
-use rustc_middle::mir::{BasicBlock, BasicBlockData, StatementKind};
+use rustc_middle::mir::Location;
+use rustc_middle::mir::{BasicBlock, BasicBlockData, Body, StatementKind};
 use rustc_middle::query::queries::mir_built::{self, ProvidedValue};
 use rustc_middle::query::Providers;
 use rustc_middle::ty;
@@ -32,6 +33,7 @@ use rustc_session::config::{self, CheckCfg};
 use rustc_session::EarlyErrorHandler;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::sync::LazyLock;
@@ -44,28 +46,82 @@ struct OurCompilerCalls {
     args: Vec<String>,
 }
 
+struct BodyModifier<'mir, 'tcx> {
+    /// MIR body under modification
+    body: &'mir mut Body<'tcx>,
+
+    /// Mapping from original locations to locations in the current MIR
+    location_table: BTreeMap<Location, Location>,
+}
+
+#[allow(unused)]
+impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
+    pub fn new<'a>(body: &'a mut Body<'tcx>) -> Self
+    where
+        'a: 'mir,
+    {
+        // Initial location table is the identity
+        let mut location_table: BTreeMap<Location, Location> = Default::default();
+        for (block, bb_data) in body.basic_blocks.iter_enumerated() {
+            for statement_index in 0..=(bb_data.statements.len()) {
+                location_table.insert(
+                    Location {
+                        block,
+                        statement_index,
+                    },
+                    Location {
+                        block,
+                        statement_index,
+                    },
+                );
+            }
+        }
+        Self {
+            body,
+            location_table,
+        }
+    }
+
+    /// Example: turns a statement into a nop
+    /// location must not be a terminator (in the original MIR)
+    pub fn make_nop_at(&mut self, loc: &Location) {
+        let current_loc = self.location_table.get(loc).unwrap();
+        self.body.basic_blocks_mut()[current_loc.block].statements[current_loc.statement_index]
+            .make_nop();
+    }
+
+    /// Example: Overwrites all (original) locations as nop
+    /// locations corresponding to newly issued statements will not be overwritten
+    pub fn overwrite_all_as_nop(&mut self) {
+        for block_ix in 0..(self.body.basic_blocks.len()) {
+            for statement_index in 0..(self.body.basic_blocks[block_ix.into()].statements.len()) {
+                let loc = Location {
+                    block: block_ix.into(),
+                    statement_index,
+                }
+                .clone();
+                self.make_nop_at(&loc);
+            }
+        }
+    }
+}
+
 #[allow(clippy::needless_lifetimes)]
 fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'tcx> {
-    println!(
-        "[log] MIR avail at mir_built: {:?}",
-        tcx.is_mir_available(def_id)
-    );
+    // execute the default provider and obtain the MIR
     let mut providers = Providers::default();
-    let original_mir_built = providers.mir_built;
     rustc_middle::middle::provide(&mut providers);
-    println!("[log] original mir_built {:?}", original_mir_built);
-    println!("[log] def path str {:?}", tcx.def_path_str(def_id));
-    println!("[log] local def id to def id{:?}", def_id.to_def_id());
-
     let mir_built_ptr = rustc_interface::DEFAULT_QUERY_PROVIDERS.mir_built;
     let mut body = mir_built_ptr(tcx, def_id).steal();
-    println!("[log] built MIR: {:?}", body.basic_blocks);
+    println!("=================================");
+    println!("[log] initial MIR: {:#?}", body.basic_blocks);
 
-    let blocks = body.basic_blocks.as_mut();
-    blocks[BasicBlock::from_usize(0)].statements[0].make_nop();
+    // Modify and return the MIR
+    let mut body_modifier = BodyModifier::new(&mut body);
+    body_modifier.overwrite_all_as_nop();
 
-    println!("[log] modified MIR: {:?}", body.basic_blocks);
-
+    println!("=================================");
+    println!("[log] modified MIR: {:#?}", body.basic_blocks);
     return tcx.alloc_steal_mir(body);
 }
 
@@ -92,7 +148,8 @@ impl rustc_driver::Callbacks for OurCompilerCalls {
         compiler: &rustc_interface::interface::Compiler,
         _queries: &'tcx rustc_interface::Queries<'tcx>,
     ) -> Compilation {
-        println!("[info] Analysis complete");
+        println!("=================================");
+        println!("[info] analysis phase complete");
 
         compiler.enter(|queries| {
             queries.global_ctxt().unwrap().enter(|tcx| {

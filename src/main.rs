@@ -20,21 +20,25 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
+use itertools::max;
 use rustc_ast_pretty::pprust::item_to_string;
 use rustc_data_structures::steal::Steal;
 use rustc_driver::Compilation;
 use rustc_errors::registry;
 use rustc_middle::middle::provide;
+use rustc_middle::mir::ClearCrossCrate;
 use rustc_middle::mir::Location;
 use rustc_middle::mir::SourceInfo;
 use rustc_middle::mir::SourceScope;
 use rustc_middle::mir::{
-    BasicBlock, BasicBlockData, Body, Statement, StatementKind, Terminator, TerminatorKind,
-    OUTERMOST_SOURCE_SCOPE,
+    BasicBlock, BasicBlockData, Body, Local, LocalDecl, LocalInfo, Mutability, Operand, Place,
+    Rvalue, Statement, StatementKind, Terminator, TerminatorKind, OUTERMOST_SOURCE_SCOPE,
 };
 use rustc_middle::query::queries::mir_built::{self, ProvidedValue};
 use rustc_middle::query::Providers;
 use rustc_middle::ty;
+use rustc_middle::ty::Ty;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, CheckCfg};
 use rustc_session::EarlyErrorHandler;
 use rustc_span::def_id::LocalDefId;
@@ -46,6 +50,7 @@ use std::fs;
 use std::mem;
 use std::sync::LazyLock;
 use std::thread::current;
+use std::vec;
 use std::{path, process, str};
 
 #[allow(dead_code)]
@@ -59,6 +64,8 @@ const FORGED_SOURCE_INFO: SourceInfo = SourceInfo {
 };
 
 struct BodyModifier<'mir, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+
     /// MIR body under modification
     body: &'mir mut Body<'tcx>,
 
@@ -113,7 +120,7 @@ impl SplitKind {
 
 #[allow(unused)]
 impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
-    pub fn new<'a>(body: &'a mut Body<'tcx>) -> Self
+    pub fn new<'a>(tcx: TyCtxt<'tcx>, body: &'a mut Body<'tcx>) -> Self
     where
         'a: 'mir,
     {
@@ -133,10 +140,55 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
                 );
             }
         }
+
         Self {
+            tcx,
             body,
             location_table,
         }
+    }
+
+    fn fresh_local(&self) -> Local {
+        max(self.body.local_decls.indices()).unwrap() + 1
+    }
+
+    pub fn local_to_place(&self, local: Local) -> Place<'tcx> {
+        Place {
+            local,
+            projection: self.tcx.mk_place_elems(&[]),
+        }
+    }
+
+    fn allocate_fresh_local(&mut self, ty: Ty<'tcx>) -> Local {
+        let local = self.fresh_local();
+        let forged_local_decl = LocalDecl {
+            mutability: Mutability::Mut,
+            source_info: FORGED_SOURCE_INFO,
+            local_info: ClearCrossCrate::Set(Box::new(LocalInfo::Boring)),
+            internal: true,
+            user_ty: None,
+            ty,
+        };
+        assert_eq!(local, self.body.local_decls.push(forged_local_decl));
+        return local;
+    }
+
+    /// Generates the test code to move out of a place
+    pub fn test_move_out(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+        /// test_local nas no projections, so we take the Ty field of p' PlaceTy for it's type
+        let test_local = self.allocate_fresh_local(p.ty(&self.body.local_decls, self.tcx).ty);
+        let test_place = self.local_to_place(test_local);
+        return vec![
+            StatementKind::StorageLive(test_local),
+            StatementKind::Assign(Box::new((test_place, Rvalue::Use(Operand::Move(p))))),
+            StatementKind::StorageDead(test_local),
+        ]
+        .into_iter()
+        .map(|kind| Statement {
+            source_info: FORGED_SOURCE_INFO,
+            kind,
+        })
+        .collect::<_>();
     }
 
     /// Example: turns a statement into a nop
@@ -263,8 +315,10 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
     println!("=================================");
     println!("[log] initial MIR: {:#?}", body.basic_blocks);
 
-    // Modify and return the MIR
-    let mut body_modifier = BodyModifier::new(&mut body);
+    // (Example) Modify and return the MIR
+    // Used with examples/reborrowing.rs
+
+    let mut body_modifier = BodyModifier::new(tcx, &mut body);
     let tb0 = body_modifier.allocate_split_branch_before(
         &mut (&Location {
             block: BasicBlock::from_u32(0),
@@ -272,23 +326,27 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
         }),
         SplitKind::Test,
     );
+    let tb0_statements =
+        body_modifier.test_move_out(body_modifier.local_to_place(Local::from_u32(1)));
+    body_modifier.set_statements(tb0, tb0_statements);
     println!("first test block is {:?}", tb0);
-    let tb1 = body_modifier.allocate_split_branch_before(
-        &mut (&Location {
-            block: BasicBlock::from_u32(0),
-            statement_index: 6,
-        }),
-        SplitKind::Inline,
-    );
-    println!("second test block is {:?}", tb1);
-    let tb2 = body_modifier.allocate_split_branch_before(
-        &mut (&Location {
-            block: BasicBlock::from_u32(0),
-            statement_index: 10,
-        }),
-        SplitKind::Approximator,
-    );
-    println!("second test block is {:?}", tb2);
+
+    // let tb1 = body_modifier.allocate_split_branch_before(
+    //     &mut (&Location {
+    //         block: BasicBlock::from_u32(0),
+    //         statement_index: 6,
+    //     }),
+    //     SplitKind::Inline,
+    // );
+    // println!("second test block is {:?}", tb1);
+    // let tb2 = body_modifier.allocate_split_branch_before(
+    //     &mut (&Location {
+    //         block: BasicBlock::from_u32(0),
+    //         statement_index: 10,
+    //     }),
+    //     SplitKind::Approximator,
+    // );
+    // println!("second test block is {:?}", tb2);
     println!("=================================");
     println!("[log] modified MIR: {:#?}", body.basic_blocks);
     return tcx.alloc_steal_mir(body);

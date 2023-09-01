@@ -66,6 +66,51 @@ struct BodyModifier<'mir, 'tcx> {
     location_table: BTreeMap<Location, Location>,
 }
 
+/// Kinds of splits we can allocate
+enum SplitKind {
+    /// adds a FalseEdge into an unreachable block
+    Test,
+    /// adds an goto into a block which goto's back into regular control flow
+    Inline,
+    /// adds a FalseEdge into a block which goto's back into the continuation
+    Approximator,
+}
+
+impl SplitKind {
+    /// Terminator to jump into the split
+    pub fn jumping_terminator<'tcx>(
+        &self,
+        kont_block: BasicBlock,
+        test_block: BasicBlock,
+    ) -> Option<Terminator<'tcx>> {
+        let kind = match self {
+            SplitKind::Approximator | SplitKind::Test => TerminatorKind::FalseEdge {
+                real_target: kont_block,
+                imaginary_target: test_block,
+            },
+            SplitKind::Inline => TerminatorKind::Goto { target: test_block },
+        };
+        Some(Terminator {
+            source_info: FORGED_SOURCE_INFO.clone(),
+            kind,
+        })
+    }
+
+    /// Terminator for the test block
+    pub fn test_terminator<'tcx>(&self, kont_block: BasicBlock) -> Option<Terminator<'tcx>> {
+        let kind = match self {
+            SplitKind::Approximator | SplitKind::Inline => {
+                TerminatorKind::Goto { target: kont_block }
+            }
+            SplitKind::Test => TerminatorKind::Unreachable,
+        };
+        Some(Terminator {
+            source_info: FORGED_SOURCE_INFO.clone(),
+            kind,
+        })
+    }
+}
+
 #[allow(unused)]
 impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
     pub fn new<'a>(body: &'a mut Body<'tcx>) -> Self
@@ -117,21 +162,6 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
         }
     }
 
-    /// Insert nop
-    /// Shift every statment in the current block down by one
-    /// if location is the terminator, this function inserts it at the end of the statements list
-    // pub fn insert_nop_before(&mut self, loc: &Location) {
-    //     let current_loc = self.location_table.get(loc).unwrap();
-    //     let current_block_statements =
-    //         &mut (self.body.basic_blocks.as_mut_preserves_cfg()[current_loc.block]).statements;
-    //     // Allocate space for the nop
-    //     current_block_statements.push(Statement {
-    //         source_info: FORGED_SOURCE_INFO.clone(),
-    //         kind: StatementKind::Nop,
-    //     });
-    //     todo!()
-    // }
-
     fn allocate_block(&mut self) -> BasicBlock {
         let block = self.body.basic_blocks.len().into();
         let default_block_data = BasicBlockData {
@@ -163,8 +193,23 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
             .unwrap()
     }
 
-    // Splits a block before the given location
-    pub fn allocate_test_branch_before(&mut self, loc: &Location) -> BasicBlock {
+    /// Shifts all LocationTable indicies after and including first_moved to new target block
+    /// The statement first_moved now points to target[0]
+    fn redirect_indices_starting_at_to_block(&mut self, first_moved: Location, target: BasicBlock) {
+        for (_, v_loc) in self.location_table.iter_mut() {
+            if (v_loc.block == first_moved.block)
+                && (v_loc.statement_index >= first_moved.statement_index)
+            {
+                *v_loc = Location {
+                    block: target,
+                    statement_index: v_loc.statement_index - first_moved.statement_index,
+                }
+            }
+        }
+    }
+
+    // Splits a block before the given location with a FalseEdge to a fresh block
+    pub fn allocate_split_branch_before(&mut self, loc: &Location, kind: SplitKind) -> BasicBlock {
         // Generate fresh block indices for the test block and continuation block
         let kont_block: BasicBlock = self.allocate_block();
         let test_block: BasicBlock = self.allocate_block();
@@ -187,21 +232,13 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
         self.set_statements(kont_block, kont_statements);
 
         // Update the terminator of the old block to be a FalseEdge
-        let new_current_terminator = Some(Terminator {
-            source_info: FORGED_SOURCE_INFO.clone(),
-            kind: TerminatorKind::FalseEdge {
-                real_target: kont_block,
-                imaginary_target: test_block,
-            },
-        });
-        self.set_terminator(current_block, new_current_terminator);
+        self.set_terminator(
+            current_block,
+            kind.jumping_terminator(kont_block, test_block),
+        );
 
         // Set up the test block
-        let test_terminator = Some(Terminator {
-            source_info: FORGED_SOURCE_INFO.clone(),
-            kind: TerminatorKind::Unreachable,
-        });
-        self.set_terminator(test_block, test_terminator);
+        self.set_terminator(test_block, kind.test_terminator(kont_block));
 
         // Update the current indicies of all locations which got moved.
         // Moved locations have their value block equal to current block
@@ -209,16 +246,7 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
         //  1. point to the freshly generated block
         //  2. subtract current_loc.statement_index from their statement_index
         // looking up loc should return (Location { kont_block, 0 }).
-        for (k_loc, v_loc) in self.location_table.iter_mut() {
-            if (v_loc.block == current_loc.block)
-                && (v_loc.statement_index >= current_loc.statement_index)
-            {
-                *v_loc = Location {
-                    block: kont_block,
-                    statement_index: v_loc.statement_index - current_loc.statement_index,
-                }
-            }
-        }
+        self.redirect_indices_starting_at_to_block(current_loc, kont_block);
 
         // Return the index of the test block, to be populated by another function
         return test_block;
@@ -237,19 +265,32 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
 
     // Modify and return the MIR
     let mut body_modifier = BodyModifier::new(&mut body);
-    let tb0 = body_modifier.allocate_test_branch_before(&Location {
-        block: BasicBlock::from_u32(0),
-        statement_index: 5,
-    });
+    let tb0 = body_modifier.allocate_split_branch_before(
+        &mut (&Location {
+            block: BasicBlock::from_u32(0),
+            statement_index: 5,
+        }),
+        SplitKind::Test,
+    );
     println!("first test block is {:?}", tb0);
-
-    // let tb1 = body_modifier.allocate_test_branch_before(&Location {
-    //     block: BasicBlock::from_u32(0),
-    //     statement_index: 5,
-    // });
-    // println!("second test block is {:?}", tb1);
-    // println!("=================================");
-    // println!("[log] modified MIR: {:#?}", body.basic_blocks);
+    let tb1 = body_modifier.allocate_split_branch_before(
+        &mut (&Location {
+            block: BasicBlock::from_u32(0),
+            statement_index: 6,
+        }),
+        SplitKind::Inline,
+    );
+    println!("second test block is {:?}", tb1);
+    let tb2 = body_modifier.allocate_split_branch_before(
+        &mut (&Location {
+            block: BasicBlock::from_u32(0),
+            statement_index: 10,
+        }),
+        SplitKind::Approximator,
+    );
+    println!("second test block is {:?}", tb2);
+    println!("=================================");
+    println!("[log] modified MIR: {:#?}", body.basic_blocks);
     return tcx.alloc_steal_mir(body);
 }
 
@@ -289,13 +330,12 @@ impl rustc_driver::Callbacks for OurCompilerCalls {
 
                 assert!(tcx.is_mir_available(main_id), "MIR is unavailable");
 
-                let mir = tcx.mir_built(main_id.as_local().unwrap());
-
                 println!("=================================");
-                println!(
-                    "[info] final MIR basic blocks: {:#?}",
-                    mir.borrow().basic_blocks
-                );
+                // let mir = tcx.mir_built(main_id.as_local().unwrap());
+                // println!(
+                //     "[info] final MIR basic blocks: {:#?}",
+                //     mir.borrow().basic_blocks
+                // );
             });
         });
 
@@ -317,6 +357,11 @@ fn main() {
     compiler_args.push("-Zalways-encode-mir".to_owned());
     compiler_args.push("-Zcrate-attr=feature(register_tool)".to_owned());
     compiler_args.push("-Zcrate-attr=register_tool(analyzer)".to_owned());
+
+    // Just here for visual testing
+    compiler_args.push("-Zdump-mir=all".to_owned());
+    compiler_args.push("-Zdump-mir-dataflow".to_owned());
+
     let mut callbacks = OurCompilerCalls {
         args: callback_args,
     };

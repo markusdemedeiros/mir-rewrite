@@ -191,6 +191,31 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
         .collect::<_>();
     }
 
+    /// Generates the test code to mutably borrow a place
+    pub fn test_mut_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+        /// test_local nas no projections, so we take the Ty field of p' PlaceTy for it's type
+        let base_ty = p.ty(&self.body.local_decls, self.tcx).ty;
+        let test_ty = Ty::new_mut_ref(
+            self.tcx,
+            unimplemented!("figure out how to generate fresh regions"),
+            base_ty,
+        );
+        let test_local = self.allocate_fresh_local(test_ty);
+        let test_place = self.local_to_place(test_local);
+        todo!();
+        // return vec![
+        //     StatementKind::StorageLive(test_local),
+        //     StatementKind::Assign(Box::new((test_place, Rvalue::Use(Operand::Move(p))))),
+        //     StatementKind::StorageDead(test_local),
+        // ]
+        // .into_iter()
+        // .map(|kind| Statement {
+        //     source_info: FORGED_SOURCE_INFO,
+        //     kind,
+        // })
+        // .collect::<_>();
+    }
+
     /// Example: turns a statement into a nop
     /// location must not be a terminator (in the original MIR)
     pub fn make_nop_at(&mut self, loc: &Location) {

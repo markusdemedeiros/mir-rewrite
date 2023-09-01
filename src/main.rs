@@ -43,6 +43,7 @@ use rustc_span::DUMMY_SP;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::mem;
 use std::sync::LazyLock;
 use std::thread::current;
 use std::{path, process, str};
@@ -131,62 +132,76 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
     //     todo!()
     // }
 
-    // Splits a block before the given location
-    pub fn allocate_test_branch_before(&mut self, loc: &Location) -> BasicBlock {
-        // Generate fresh block indices for the test block and continuation block
-        let kont_block: BasicBlock = self.body.basic_blocks.len().into();
-        let test_block: BasicBlock = (self.body.basic_blocks.len() + 1).into();
+    fn allocate_block(&mut self) -> BasicBlock {
+        let block = self.body.basic_blocks.len().into();
+        let default_block_data = BasicBlockData {
+            statements: vec![],
+            terminator: None,
+            is_cleanup: false,
+        };
+        assert_eq!(
+            block,
+            self.body.basic_blocks.as_mut().push(default_block_data)
+        );
+        return block;
+    }
 
-        // current location corresponding to loc
-        let current_loc = *self.location_table.get(loc).unwrap();
-        // data for the current block
-        let current_block_data = self
-            .body
+    fn set_terminator(&mut self, block: BasicBlock, terminator: Option<Terminator<'tcx>>) {
+        self.body.basic_blocks.as_mut()[block].terminator = terminator;
+    }
+
+    fn set_statements(&mut self, block: BasicBlock, statements: Vec<Statement<'tcx>>) {
+        self.body.basic_blocks.as_mut()[block].statements = statements;
+    }
+
+    fn get_data_mut(&mut self, block: BasicBlock) -> &mut BasicBlockData<'tcx> {
+        self.body
             .basic_blocks
             .as_mut()
             .as_mut_slice()
-            .get_mut(current_loc.block)
-            .unwrap();
+            .get_mut(block)
+            .unwrap()
+    }
 
-        // collect the MIR statements that belong in the continuation
-        let mut kont_block_data = BasicBlockData {
-            statements: current_block_data.statements[current_loc.statement_index..].to_vec(),
-            terminator: current_block_data.terminator.clone(),
-            is_cleanup: false,
-        };
+    // Splits a block before the given location
+    pub fn allocate_test_branch_before(&mut self, loc: &Location) -> BasicBlock {
+        // Generate fresh block indices for the test block and continuation block
+        let kont_block: BasicBlock = self.allocate_block();
+        let test_block: BasicBlock = self.allocate_block();
+
+        // current location corresponding to loc
+        let current_loc = *self.location_table.get(loc).unwrap();
+        let current_block = current_loc.block;
+        let current_block_data = self.get_data_mut(current_block);
+
+        // Copy out the data for the continuation
+        let kont_statements = current_block_data.statements[current_loc.statement_index..].to_vec();
+        let kont_terminator = current_block_data.terminator.clone();
 
         // Keep only the statements before the split in the old block
         current_block_data.statements =
             current_block_data.statements[0..current_loc.statement_index].to_vec();
 
+        // collect the MIR statements that belong in the continuation
+        self.set_terminator(kont_block, kont_terminator);
+        self.set_statements(kont_block, kont_statements);
+
         // Update the terminator of the old block to be a FalseEdge
-        current_block_data.terminator = Some(Terminator {
+        let new_current_terminator = Some(Terminator {
             source_info: FORGED_SOURCE_INFO.clone(),
             kind: TerminatorKind::FalseEdge {
                 real_target: kont_block,
                 imaginary_target: test_block,
             },
         });
+        self.set_terminator(current_block, new_current_terminator);
 
         // Set up the test block
-        let mut test_block_data = BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
-                source_info: FORGED_SOURCE_INFO.clone(),
-                kind: TerminatorKind::Unreachable,
-            }),
-            is_cleanup: false,
-        };
-
-        // Move the test continuation block and the test block into the MIR
-        assert_eq!(
-            kont_block,
-            self.body.basic_blocks.as_mut().push(kont_block_data)
-        );
-        assert_eq!(
-            test_block,
-            self.body.basic_blocks.as_mut().push(test_block_data)
-        );
+        let test_terminator = Some(Terminator {
+            source_info: FORGED_SOURCE_INFO.clone(),
+            kind: TerminatorKind::Unreachable,
+        });
+        self.set_terminator(test_block, test_terminator);
 
         // Update the current indicies of all locations which got moved.
         // Moved locations have their value block equal to current block

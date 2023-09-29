@@ -38,11 +38,13 @@ use rustc_middle::mir::SourceInfo;
 use rustc_middle::mir::SourceScope;
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, Body, Local, LocalDecl, LocalInfo, Mutability, Operand, Place,
-    Rvalue, Statement, StatementKind, Terminator, TerminatorKind, OUTERMOST_SOURCE_SCOPE,
+    Rvalue, Statement, StatementKind, Terminator, TerminatorKind, OUTERMOST_SOURCE_SCOPE, BorrowKind, MutBorrowKind
 };
 use rustc_middle::query::queries::mir_built::{self, ProvidedValue};
 use rustc_middle::query::Providers;
 use rustc_middle::ty;
+use rustc_middle::ty::Region;
+use rustc_middle::ty::RegionVid;
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, CheckCfg};
@@ -69,6 +71,8 @@ const FORGED_SOURCE_INFO: SourceInfo = SourceInfo {
     scope: OUTERMOST_SOURCE_SCOPE,
 };
 
+const MAX_FORGED_REGION_INDEX: u32 = 0xFFFF_FF00;
+
 struct BodyModifier<'mir, 'tcx> {
     tcx: TyCtxt<'tcx>,
 
@@ -77,6 +81,10 @@ struct BodyModifier<'mir, 'tcx> {
 
     /// Mapping from original locations to locations in the current MIR
     location_table: BTreeMap<Location, Location>,
+
+    /// Index for generating free regions
+    next_free_region: u32,
+
 }
 
 /// Kinds of splits we can allocate
@@ -151,6 +159,7 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
             tcx,
             body,
             location_table,
+            next_free_region: MAX_FORGED_REGION_INDEX,
         }
     }
 
@@ -163,6 +172,20 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
             local,
             projection: self.tcx.mk_place_elems(&[]),
         }
+    }
+
+    fn fresh_region(&mut self) -> Region<'tcx> {
+        /* all regions in this phase of MIR appear to be ReErased; if we give regions fresh
+         * indicies will the borrow checker work everything out? */
+        let r = self.next_free_region;
+        self.next_free_region -= 1;
+        Region::new_var(self.tcx, RegionVid::from_u32(r))
+    }
+
+    pub(crate) fn show_all_types(&self) {
+       for d in self.body.local_decls.iter() {
+            println!("- {:#?}", d.ty);
+       }
     }
 
     fn allocate_fresh_local(&mut self, ty: Ty<'tcx>) -> Local {
@@ -201,25 +224,28 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
     pub fn test_mut_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
         /// test_local nas no projections, so we take the Ty field of p' PlaceTy for it's type
         let base_ty = p.ty(&self.body.local_decls, self.tcx).ty;
+        // FIXME: do these regions need to be the same? What is Rvalue::ref expecting?
+        let test_borrow_region = self.fresh_region();
+        let test_assigned_region = self.fresh_region();
         let test_ty = Ty::new_mut_ref(
             self.tcx,
-            unimplemented!("figure out how to generate fresh regions"),
+            test_assigned_region,
             base_ty,
         );
         let test_local = self.allocate_fresh_local(test_ty);
         let test_place = self.local_to_place(test_local);
-        todo!();
-        // return vec![
-        //     StatementKind::StorageLive(test_local),
-        //     StatementKind::Assign(Box::new((test_place, Rvalue::Use(Operand::Move(p))))),
-        //     StatementKind::StorageDead(test_local),
-        // ]
-        // .into_iter()
-        // .map(|kind| Statement {
-        //     source_info: FORGED_SOURCE_INFO,
-        //     kind,
-        // })
-        // .collect::<_>();
+        let test_borrow_kind = BorrowKind::Mut {kind: MutBorrowKind::Default};
+        return vec![
+            StatementKind::StorageLive(test_local),
+            StatementKind::Assign(Box::new((test_place, Rvalue::Ref(test_borrow_region, test_borrow_kind, p)))),
+            StatementKind::StorageDead(test_local),
+        ]
+        .into_iter()
+        .map(|kind| Statement {
+            source_info: FORGED_SOURCE_INFO,
+            kind,
+        })
+        .collect::<_>();
     }
 
     /// Example: turns a statement into a nop
@@ -357,10 +383,13 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
         }),
         SplitKind::Test,
     );
+
     let tb0_statements =
-        body_modifier.test_move_out(body_modifier.local_to_place(Local::from_u32(1)));
+        body_modifier.test_mut_borrow(body_modifier.local_to_place(Local::from_u32(1)));
+        /*  body_modifier.test_move_out(body_modifier.local_to_place(Local::from_u32(1))); */
     body_modifier.set_statements(tb0, tb0_statements);
     println!("first test block is {:?}", tb0);
+
 
     // let tb1 = body_modifier.allocate_split_branch_before(
     //     &mut (&Location {

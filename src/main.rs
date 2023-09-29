@@ -220,21 +220,36 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
         .collect::<_>();
     }
 
-    /// Generates the test code to mutably borrow a place
-    pub fn test_mut_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+
+    fn test_mut_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+        self.test_borrow(true, p)
+    }
+
+    fn test_shared_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+        self.test_borrow(false, p)
+    }
+
+
+
+    /// Generates the test code to borrow a place
+    fn test_borrow(&mut self, mutable: bool, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
         /// test_local nas no projections, so we take the Ty field of p' PlaceTy for it's type
         let base_ty = p.ty(&self.body.local_decls, self.tcx).ty;
         // FIXME: do these regions need to be the same? What is Rvalue::ref expecting?
         let test_borrow_region = self.fresh_region();
         let test_assigned_region = self.fresh_region();
-        let test_ty = Ty::new_mut_ref(
-            self.tcx,
-            test_assigned_region,
-            base_ty,
-        );
+        let test_ty = if mutable {
+            Ty::new_mut_ref(self.tcx, test_assigned_region, base_ty)
+        } else {
+            Ty::new_imm_ref(self.tcx, test_assigned_region, base_ty)
+        };
         let test_local = self.allocate_fresh_local(test_ty);
         let test_place = self.local_to_place(test_local);
-        let test_borrow_kind = BorrowKind::Mut {kind: MutBorrowKind::Default};
+        let test_borrow_kind = if mutable {
+            BorrowKind::Mut {kind: MutBorrowKind::Default}
+        } else {
+            BorrowKind::Shallow
+        };
         return vec![
             StatementKind::StorageLive(test_local),
             StatementKind::Assign(Box::new((test_place, Rvalue::Ref(test_borrow_region, test_borrow_kind, p)))),
@@ -385,7 +400,7 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
     );
 
     let tb0_statements =
-        body_modifier.test_mut_borrow(body_modifier.local_to_place(Local::from_u32(1)));
+        body_modifier.test_shared_borrow(body_modifier.local_to_place(Local::from_u32(1)));
         /*  body_modifier.test_move_out(body_modifier.local_to_place(Local::from_u32(1))); */
     body_modifier.set_statements(tb0, tb0_statements);
     println!("first test block is {:?}", tb0);

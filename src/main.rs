@@ -5,6 +5,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #![feature(rustc_private)]
+#![feature(box_patterns)]
 #![allow(unused_imports)]
 #![feature(lazy_cell)]
 #![feature(lazy_cell_consume)]
@@ -38,8 +39,9 @@ use rustc_middle::mir::SourceInfo;
 use rustc_middle::mir::SourceScope;
 use rustc_middle::mir::{
     BasicBlock, BasicBlockData, Body, Local, LocalDecl, LocalInfo, Mutability, Operand, Place,
-    Rvalue, Statement, StatementKind, Terminator, TerminatorKind, OUTERMOST_SOURCE_SCOPE, BorrowKind, MutBorrowKind
+    Rvalue, Statement, StatementKind, Terminator, TerminatorKind, OUTERMOST_SOURCE_SCOPE, BorrowKind, MutBorrowKind, Constant, CallSource, UnwindAction, UnwindTerminateReason, ConstantKind
 };
+use rustc_middle::mir::interpret::ConstValue;
 use rustc_middle::query::queries::mir_built::{self, ProvidedValue};
 use rustc_middle::query::Providers;
 use rustc_middle::ty;
@@ -50,6 +52,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, CheckCfg};
 use rustc_session::EarlyErrorHandler;
 use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::DefId;
 use rustc_span::source_map;
 use rustc_span::DUMMY_SP;
 use std::collections::BTreeMap;
@@ -72,6 +75,7 @@ const FORGED_SOURCE_INFO: SourceInfo = SourceInfo {
 };
 
 const MAX_FORGED_REGION_INDEX: u32 = 0xFFFF_FF00;
+const MAX_FORGED_DEF_ID: u32 = 0xFFFF_FF00;
 
 struct BodyModifier<'mir, 'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -84,6 +88,9 @@ struct BodyModifier<'mir, 'tcx> {
 
     /// Index for generating free regions
     next_free_region: u32,
+
+    /// Index for generating new DefIds
+    next_free_def_id: u32,
 
 }
 
@@ -160,6 +167,7 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
             body,
             location_table,
             next_free_region: MAX_FORGED_REGION_INDEX,
+            next_free_def_id: MAX_FORGED_DEF_ID,
         }
     }
 
@@ -167,11 +175,19 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
         max(self.body.local_decls.indices()).unwrap() + 1
     }
 
+
     pub fn local_to_place(&self, local: Local) -> Place<'tcx> {
         Place {
             local,
             projection: self.tcx.mk_place_elems(&[]),
         }
+    }
+
+    fn forge_def_id(&mut self) -> DefId {
+        //FIXME: doesn't check that this isn't already a DefIdIndex
+        let r = self.next_free_def_id;
+        self.next_free_def_id -= 1;
+        DefId::local(r.into())
     }
 
     fn fresh_region(&mut self) -> Region<'tcx> {
@@ -221,14 +237,13 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
     }
 
 
-    fn test_mut_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+    pub fn test_mut_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
         self.test_borrow(true, p)
     }
 
-    fn test_shared_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
+    pub fn test_shared_borrow(&mut self, p: Place<'tcx>) -> Vec<Statement<'tcx>> {
         self.test_borrow(false, p)
     }
-
 
 
     /// Generates the test code to borrow a place
@@ -261,6 +276,43 @@ impl<'mir, 'tcx: 'mir> BodyModifier<'mir, 'tcx> {
             kind,
         })
         .collect::<_>();
+    }
+
+
+    /// Generate a list of statements to test a move-in statement
+    /// This also generates a new basic block, to jump to after the call.
+    fn test_move_in(&mut self, block: BasicBlock, p: Place<'tcx>) {
+        let base_ty = p.ty(&self.body.local_decls, self.tcx).ty;
+
+        let kont_block = self.allocate_block();
+        let kont_terminator = Terminator {
+            kind: TerminatorKind::Return,
+            source_info: FORGED_SOURCE_INFO,
+        };
+        self.set_statements(kont_block, vec![]);
+        self.set_terminator(kont_block, Some(kont_terminator));
+
+        // FIXME: Requires testing. Will the typechecker complan that we are assigning to a nonexistent defID
+        let call_ty = Ty::new_fn_def(self.tcx, self.forge_def_id(), [base_ty]);
+        let call_terminator_kind = TerminatorKind::Call{
+            func: Operand::Constant(Box::new(Constant {
+                span: DUMMY_SP,
+                user_ty: None,
+                literal: ConstantKind::Val(ConstValue::ZeroSized, call_ty)
+            })),
+            args: vec![],
+            destination: p,
+            target: Some(kont_block),
+            unwind: UnwindAction::Terminate(UnwindTerminateReason::Abi),
+            call_source: CallSource::Normal,
+            fn_span: DUMMY_SP,
+        };
+        let call_terminator = Terminator {
+            kind: call_terminator_kind,
+            source_info: FORGED_SOURCE_INFO,
+        };
+        self.set_statements(block, vec![]);
+        self.set_terminator(block, Some(call_terminator));
     }
 
     /// Example: turns a statement into a nop
@@ -399,10 +451,11 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
         SplitKind::Test,
     );
 
-    let tb0_statements =
-        body_modifier.test_shared_borrow(body_modifier.local_to_place(Local::from_u32(1)));
-        /*  body_modifier.test_move_out(body_modifier.local_to_place(Local::from_u32(1))); */
-    body_modifier.set_statements(tb0, tb0_statements);
+    body_modifier.test_move_in(tb0, body_modifier.local_to_place(Local::from_u32(1)));
+    // let tb0_statements =
+    //     body_modifier.test_shared_borrow(body_modifier.local_to_place(Local::from_u32(1)));
+    //     /*  body_modifier.test_move_out(body_modifier.local_to_place(Local::from_u32(1))); */
+    // body_modifier.set_statements(tb0, tb0_statements);
     println!("first test block is {:?}", tb0);
 
 
@@ -424,6 +477,27 @@ fn mir_built<'tcx>(tcx: ty::TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'
     // println!("second test block is {:?}", tb2);
     println!("=================================");
     println!("[log] modified MIR: {:#?}", body.basic_blocks);
+
+    // for bb in body.basic_blocks.iter() {
+    //     if let TerminatorKind::Call{func, args, destination, target, unwind, call_source, fn_span} = (&bb.terminator).clone().unwrap().kind {
+    //         if let Operand::Constant(box Constant {span, user_ty, literal}) = func {
+    //             if let Val{constant_value: ZeroSized, ty} = literal {
+
+    //             }
+    //             println!("{:?}", span);         // Forged
+    //             println!("{:?}", user_ty);      // None
+    //             println!("{:?}", literal);      // FnDef
+    //         }
+    //         println!("{:?}", args); // args is empty list
+    //         println!("{:?}", destination);
+    //         println!("{:?}", target);
+    //         println!("{:?}", unwind);
+    //         println!("{:?}", call_source); // Normal
+    //         println!("{:?}", fn_span); // Forged
+    //     }
+    // }
+
+
     return tcx.alloc_steal_mir(body);
 }
 
@@ -452,6 +526,8 @@ impl rustc_driver::Callbacks for OurCompilerCalls {
         println!("=================================");
         println!("[info] analysis phase complete");
 
+        /*
+        // For debugigng
         compiler.enter(|queries| {
             queries.global_ctxt().unwrap().enter(|tcx| {
                 println!("[info] entered the compiler");
@@ -470,6 +546,7 @@ impl rustc_driver::Callbacks for OurCompilerCalls {
                 // );
             });
         });
+        */
 
         Compilation::Stop
     }
